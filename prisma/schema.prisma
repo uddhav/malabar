@@ -1,0 +1,487 @@
+// Prisma schema for Personal Finance MVP
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ==================== USER & AUTHENTICATION ====================
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // User profile & settings
+  industry      String?   // For tax categorization clustering (e.g., "freelancer", "driver", "consultant")
+  profession    String?   // More specific role
+  preferences   Json?     // Store flexible user preferences
+
+  // Relations
+  accounts          Account[]
+  sessions          Session[]
+  plaidItems        PlaidItem[]
+  creditCards       CreditCard[]
+  billingCycles     BillingCycle[]
+  transactions      Transaction[]
+  rewardsCards      RewardsCard[]
+  taxCategories     TaxCategoryRule[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ==================== PLAID INTEGRATION ====================
+
+model PlaidItem {
+  id                    String    @id @default(cuid())
+  userId                String
+  plaidAccessToken      String    @unique
+  plaidItemId           String    @unique
+  institutionId         String
+  institutionName       String?
+
+  // Connection status
+  status                String    @default("active") // active, requires_update, error
+  lastSuccessfulSync    DateTime?
+  lastSyncAttempt       DateTime?
+
+  // Webhook management
+  webhookUrl            String?
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  // Relations
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditCards           CreditCard[]
+  transactions          Transaction[]
+
+  @@index([userId])
+  @@map("plaid_items")
+}
+
+// ==================== BILLING CYCLE TRACKING ====================
+
+model CreditCard {
+  id                      String    @id @default(cuid())
+  userId                  String
+  plaidItemId             String?
+  plaidAccountId          String?   @unique
+
+  // Card details
+  name                    String    // User-friendly name (e.g., "Chase Sapphire Reserve")
+  lastFourDigits          String?
+  issuer                  String?   // e.g., "Chase", "Amex", "Citi"
+  network                 String?   // e.g., "Visa", "Mastercard", "Amex"
+
+  // Current balances (from Plaid Liabilities API)
+  currentBalance          Decimal?  @db.Decimal(12, 2)
+  availableCredit         Decimal?  @db.Decimal(12, 2)
+  creditLimit             Decimal?  @db.Decimal(12, 2)
+
+  // Billing cycle pattern (inferred from historical data)
+  typicalCycleLength      Int?      // Days (usually 28-31)
+  statementDayOfMonth     Int?      // Consistent day if applicable (1-31)
+  dueDateOffset           Int?      // Days between statement and due date (usually 20-25)
+
+  // Pattern confidence scoring
+  patternConfidence       Float     @default(0.0) // 0.0-1.0
+  lastPatternAnalysis     DateTime?
+
+  // APR and fees
+  aprPercentage           Decimal?  @db.Decimal(5, 2)
+  annualFee               Decimal?  @db.Decimal(8, 2)
+
+  // Status
+  isActive                Boolean   @default(true)
+  isClosed                Boolean   @default(false)
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  // Relations
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plaidItem               PlaidItem?        @relation(fields: [plaidItemId], references: [id], onDelete: SetNull)
+  billingCycles           BillingCycle[]
+  transactions            Transaction[]
+  rewardsCard             RewardsCard?
+
+  @@index([userId])
+  @@index([plaidItemId])
+  @@map("credit_cards")
+}
+
+model BillingCycle {
+  id                      String    @id @default(cuid())
+  creditCardId            String
+  userId                  String
+
+  // Cycle dates
+  cycleStartDate          DateTime
+  cycleEndDate            DateTime  // Statement closing date
+  paymentDueDate          DateTime
+
+  // Financial details
+  statementBalance        Decimal?  @db.Decimal(12, 2)
+  minimumPaymentDue       Decimal?  @db.Decimal(12, 2)
+  interestCharged         Decimal?  @db.Decimal(12, 2)
+  feesCharged             Decimal?  @db.Decimal(12, 2)
+
+  // Payment tracking
+  actualPaymentAmount     Decimal?  @db.Decimal(12, 2)
+  actualPaymentDate       DateTime?
+  isPaid                  Boolean   @default(false)
+  isOverdue               Boolean   @default(false)
+
+  // Data quality & confidence
+  dataSource              String    @default("inferred") // "plaid", "inferred", "manual"
+  confidence              Float     @default(0.5) // 0.0-1.0
+
+  // Projection vs. actual
+  isProjected             Boolean   @default(false) // Future cycles are projected
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  // Relations
+  creditCard              CreditCard        @relation(fields: [creditCardId], references: [id], onDelete: Cascade)
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions            Transaction[]
+
+  @@index([creditCardId])
+  @@index([userId])
+  @@index([cycleEndDate])
+  @@index([paymentDueDate])
+  @@map("billing_cycles")
+}
+
+// ==================== TRANSACTIONS ====================
+
+model Transaction {
+  id                      String    @id @default(cuid())
+  userId                  String
+  creditCardId            String?
+  billingCycleId          String?
+  plaidItemId             String?
+
+  // Plaid transaction data
+  plaidTransactionId      String?   @unique
+
+  // Transaction details
+  amount                  Decimal   @db.Decimal(12, 2)
+  date                    DateTime
+  postDate                DateTime? // Actual posting date vs. transaction date
+  isPending               Boolean   @default(false)
+
+  // Merchant & categorization
+  merchantName            String?
+  merchantEntityId        String?   // Plaid's stable merchant identifier
+  merchantLogo            String?
+  merchantWebsite         String?
+
+  // Plaid enrichment
+  category                String[]  // Plaid's personal finance categories
+  primaryCategory         String?
+  detailedCategory        String?
+  merchantCategoryCode    String?   // MCC code
+
+  // Location data
+  location                Json?     // {address, city, region, postal_code, country, lat, lon}
+  paymentChannel          String?   // "online", "in_store", "other"
+
+  // Tax categorization (Phase 3)
+  taxCategory             String?   // IRS Schedule C category
+  isBusinessExpense       Boolean   @default(false)
+  isDeductible            Boolean   @default(false)
+  deductiblePercentage    Int       @default(100) // For partial deductions (e.g., meals = 50%)
+  businessPurpose         String?   // User-provided documentation
+  taxCategoryConfidence   Float?    // ML confidence score
+
+  // Receipt tracking
+  hasReceipt              Boolean   @default(false)
+  receiptUrl              String?
+  receiptOcrData          Json?     // Line items from OCR
+
+  // Duplicate detection
+  isDuplicate             Boolean   @default(false)
+  duplicateOfId           String?
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  // Relations
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditCard              CreditCard?       @relation(fields: [creditCardId], references: [id], onDelete: SetNull)
+  billingCycle            BillingCycle?     @relation(fields: [billingCycleId], references: [id], onDelete: SetNull)
+  plaidItem               PlaidItem?        @relation(fields: [plaidItemId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([creditCardId])
+  @@index([billingCycleId])
+  @@index([date])
+  @@index([merchantEntityId])
+  @@index([isBusinessExpense])
+  @@map("transactions")
+}
+
+// ==================== REWARDS OPTIMIZATION ====================
+
+model RewardsCard {
+  id                      String    @id @default(cuid())
+  userId                  String
+  creditCardId            String?   @unique // Optional link to actual credit card
+
+  // Card identification
+  cardName                String    // e.g., "Chase Sapphire Preferred"
+  issuer                  String    // "Chase", "Amex", "Citi", etc.
+  network                 String?   // "Visa", "Mastercard", "Amex", "Discover"
+
+  // Base rewards
+  baseRewardRate          Decimal   @db.Decimal(5, 2) // Base points/cashback percentage
+  rewardsCurrency         String    @default("cashback") // "cashback", "points", "miles"
+
+  // Category bonuses (stored as JSON for flexibility)
+  categoryBonuses         Json?     // [{"category": "dining", "rate": 3.0, "cap": 1500}]
+
+  // Rotating categories
+  hasRotatingCategories   Boolean   @default(false)
+  rotatingCategories      Json?     // [{"quarter": "Q1-2025", "categories": ["gas", "groceries"], "rate": 5.0, "cap": 1500}]
+  requiresActivation      Boolean   @default(false)
+
+  // Fees and limits
+  annualFee               Decimal   @db.Decimal(8, 2) @default(0)
+
+  // Sign-up bonus tracking
+  signUpBonus             Decimal?  @db.Decimal(10, 2)
+  signUpBonusRequirement  Decimal?  @db.Decimal(10, 2) // Minimum spend required
+  signUpBonusDeadline     DateTime?
+  signUpBonusProgress     Decimal?  @db.Decimal(10, 2) @default(0)
+
+  // Status
+  isActive                Boolean   @default(true)
+
+  // Metadata
+  cardImageUrl            String?
+  issuerWebsite           String?
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  // Relations
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creditCard              CreditCard?       @relation(fields: [creditCardId], references: [id], onDelete: SetNull)
+  spendingTracking        CategorySpending[]
+
+  @@index([userId])
+  @@map("rewards_cards")
+}
+
+model CategorySpending {
+  id                      String    @id @default(cuid())
+  rewardsCardId           String
+
+  // Time period
+  periodStart             DateTime
+  periodEnd               DateTime
+  periodType              String    // "monthly", "quarterly", "annual"
+
+  // Category tracking
+  category                String    // "dining", "gas", "groceries", "travel", etc.
+  amountSpent             Decimal   @db.Decimal(12, 2) @default(0)
+  spendingCap             Decimal?  @db.Decimal(12, 2)
+  rewardsEarned           Decimal   @db.Decimal(12, 2) @default(0)
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  // Relations
+  rewardsCard             RewardsCard       @relation(fields: [rewardsCardId], references: [id], onDelete: Cascade)
+
+  @@unique([rewardsCardId, periodStart, category])
+  @@index([rewardsCardId])
+  @@map("category_spending")
+}
+
+// Merchant database for rewards optimization
+model Merchant {
+  id                      String    @id @default(cuid())
+
+  // Merchant identification
+  merchantName            String    @unique
+  merchantEntityId        String?   @unique // Plaid's stable ID
+  merchantCategoryCode    String?
+
+  // Categorization
+  primaryCategory         String
+  detailedCategory        String?
+
+  // Location info
+  websiteUrl              String?
+  logoUrl                 String?
+
+  // Metadata
+  transactionCount        Int       @default(0) // How many times users transacted
+  lastSeenAt              DateTime  @default(now())
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@index([merchantEntityId])
+  @@index([primaryCategory])
+  @@map("merchants")
+}
+
+// ==================== TAX DEDUCTION TRACKING ====================
+
+model TaxCategoryRule {
+  id                      String    @id @default(cuid())
+  userId                  String
+
+  // Rule definition
+  merchantPattern         String?   // Regex or exact match
+  merchantEntityId        String?
+  categoryPattern         String?   // Transaction category match
+  amountMin               Decimal?  @db.Decimal(12, 2)
+  amountMax               Decimal?  @db.Decimal(12, 2)
+
+  // Tax treatment
+  taxCategory             String    // IRS Schedule C category
+  isDeductible            Boolean   @default(true)
+  deductiblePercentage    Int       @default(100)
+  requiresDocumentation   Boolean   @default(false)
+
+  // Rule metadata
+  ruleName                String?
+  isActive                Boolean   @default(true)
+  priority                Int       @default(0) // Higher priority rules match first
+
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  // Relations
+  user                    User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("tax_category_rules")
+}
+
+// ML model training data (for continuous learning)
+model TaxCategorizationFeedback {
+  id                      String    @id @default(cuid())
+  transactionId           String
+
+  // Original prediction
+  predictedCategory       String
+  predictedConfidence     Float
+
+  // User correction
+  actualCategory          String
+  wasAccepted             Boolean   // Did user accept or modify?
+
+  // Context for retraining
+  merchantName            String?
+  amount                  Decimal   @db.Decimal(12, 2)
+  category                String[]
+  userIndustry            String?
+
+  feedbackDate            DateTime  @default(now())
+
+  @@index([predictedCategory])
+  @@index([actualCategory])
+  @@map("tax_categorization_feedback")
+}
+
+// ==================== WEBHOOKS & SYNC LOGS ====================
+
+model SyncLog {
+  id                      String    @id @default(cuid())
+  plaidItemId             String?
+  userId                  String?
+
+  syncType                String    // "liabilities", "transactions", "webhook"
+  status                  String    // "success", "error", "partial"
+
+  // Metrics
+  recordsProcessed        Int       @default(0)
+  recordsCreated          Int       @default(0)
+  recordsUpdated          Int       @default(0)
+  errorCount              Int       @default(0)
+
+  // Details
+  errorMessage            String?
+  metadata                Json?     // Additional sync details
+
+  startedAt               DateTime  @default(now())
+  completedAt             DateTime?
+  duration                Int?      // Milliseconds
+
+  @@index([plaidItemId])
+  @@index([userId])
+  @@index([startedAt])
+  @@map("sync_logs")
+}
+
+model WebhookLog {
+  id                      String    @id @default(cuid())
+
+  webhookType             String    // "DEFAULT_UPDATE", "SYNC_UPDATES_AVAILABLE", etc.
+  plaidItemId             String?
+
+  payload                 Json
+  processed               Boolean   @default(false)
+  processedAt             DateTime?
+
+  receivedAt              DateTime  @default(now())
+
+  @@index([webhookType])
+  @@index([processed])
+  @@index([receivedAt])
+  @@map("webhook_logs")
+}
